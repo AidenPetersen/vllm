@@ -15,7 +15,7 @@ import vllm.envs as envs
 from vllm.config import CompilationMode, CUDAGraphMode, get_current_vllm_config
 from vllm.config.compilation import DynamicShapesType
 from vllm.logger import init_logger
-from vllm.utils.nvtx_pytorch_hooks import layerwise_nvtx_marker_context
+from vllm.utils.gpu_tracing_hooks import layerwise_tracing_marker_context
 
 logger = init_logger(__name__)
 
@@ -98,7 +98,7 @@ class TorchCompileWithNoGuardsWrapper:
         if self.layerwise_nvtx_tracing_enabled:
             args_list = list(args)
             kwargs_dict = dict(kwargs)
-            with layerwise_nvtx_marker_context(
+            with layerwise_tracing_marker_context(
                 "Torch Compiled Module (input):{}".format(self.__class__.__name__),
                 self,
                 in_tensor=args_list,

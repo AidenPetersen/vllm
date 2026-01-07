@@ -220,10 +220,13 @@ class TorchProfilerWrapper(WorkerProfiler):
         return torch.profiler.record_function(name)
 
 
-class CudaProfilerWrapper(WorkerProfiler):
+class GpuProfilerWrapper(WorkerProfiler):
+    """GPU profiler wrapper that works on both NVIDIA (CUDA) and AMD (ROCm) platforms."""
+
     def __init__(self, profiler_config: ProfilerConfig) -> None:
         super().__init__(profiler_config)
-        # Note: lazy import to avoid dependency issues if CUDA is not available.
+        # Note: lazy import to avoid dependency issues if GPU is not available.
+        # torch.cuda.profiler works on both CUDA and ROCm (via HIP)
         import torch.cuda.profiler as cuda_profiler
 
         self._cuda_profiler = cuda_profiler
@@ -238,4 +241,11 @@ class CudaProfilerWrapper(WorkerProfiler):
 
     @override
     def annotate_context_manager(self, name: str):
-        return torch.cuda.nvtx.range(name)
+        # Use platform-agnostic tracing (works for both nvtx and roctx)
+        from vllm.utils.tracing import annotate
+
+        return annotate(name)
+
+
+# Backward compatibility alias
+CudaProfilerWrapper = GpuProfilerWrapper

@@ -95,7 +95,7 @@ from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import DeviceMemoryProfiler
-from vllm.utils.nvtx_pytorch_hooks import PytHooks
+from vllm.utils.gpu_tracing_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
     get_dtype_size,
@@ -673,7 +673,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-        self.layerwise_nvtx_hooks_registered = False
+        self.layerwise_tracing_hooks_registered = False
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -3071,15 +3071,16 @@ class GPUModelRunner(
             cudagraph_stats,
         )
 
-    def _register_layerwise_nvtx_hooks(self) -> None:
+    def _register_layerwise_tracing_hooks(self) -> None:
         """
-        Register layerwise NVTX hooks if --enable-layerwise-nvtx-tracing is enabled
+        Register layerwise GPU tracing hooks if --enable-layerwise-nvtx-tracing is enabled
         to trace detailed information of each layer or module in the model.
+        Works on both NVIDIA (nvtx) and AMD (roctx) platforms.
         """
 
         if (
             self.vllm_config.observability_config.enable_layerwise_nvtx_tracing
-            and not self.layerwise_nvtx_hooks_registered
+            and not self.layerwise_tracing_hooks_registered
         ):
             if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
                 logger.debug_once(
@@ -3090,8 +3091,8 @@ class GPUModelRunner(
 
             # In STOCK_TORCH_COMPILE mode, after registering hooks here,
             # the __call__ function of nn.module will be recompiled with
-            # fullgraph=True. Since nvtx.range_push/pop are not traceable
-            # by torch dynamo, we can't register hook functions here
+            # fullgraph=True. Since tracing range_push/pop operations are not
+            # traceable by torch dynamo, we can't register hook functions here
             # because hook functions will also be traced by torch dynamo.
             if (
                 self.vllm_config.compilation_config.mode
@@ -3105,7 +3106,7 @@ class GPUModelRunner(
             else:
                 pyt_hooks = PytHooks()
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
-                self.layerwise_nvtx_hooks_registered = True
+                self.layerwise_tracing_hooks_registered = True
 
     @torch.inference_mode()
     def execute_model(
@@ -4497,7 +4498,7 @@ class GPUModelRunner(
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
-        # done to avoid nvtx operations in hook functions being traced by
+        # done to avoid tracing operations in hook functions being traced by
         # torch dynamo and causing graph breaks.
         # Note that for DYNAMO_ONCE and VLLM_COMPILE mode,
         # compiled model's dynamo tracing is only done once and the compiled model's
@@ -4505,7 +4506,7 @@ class GPUModelRunner(
         # So it's safe to register hooks here. Hooks will be registered to
         # both compiled and uncompiled models but they will never
         # be called on the compiled model execution path.
-        self._register_layerwise_nvtx_hooks()
+        self._register_layerwise_tracing_hooks()
 
         # This is necessary to avoid blocking DP.
         # For dummy runs, we typically skip EPLB since we don't have any real

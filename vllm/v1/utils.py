@@ -392,10 +392,11 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     func = contextlib.nullcontext
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
         func = record_function
-    elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
-        import nvtx
+    elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING or envs.VLLM_ROCTX_SCOPES_FOR_PROFILING:
+        # Use platform-agnostic tracing (works for both nvtx and roctx)
+        from vllm.utils.tracing import get_annotate_func
 
-        func = nvtx.annotate
+        func = get_annotate_func()
 
     _PROFILER_FUNC = func
     return func(name)

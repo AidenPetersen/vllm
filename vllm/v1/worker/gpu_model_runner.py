@@ -6052,6 +6052,200 @@ class GPUModelRunner(
                     stats.encoder_forward_time += per_request_time
                     stats.num_encoder_calls += 1
 
+    def get_captured_graphs(
+        self,
+    ) -> dict[int | BatchDescriptor, torch.cuda.CUDAGraph]:
+        """Return all captured CUDA graphs for benchmarking.
+
+        This method collects graphs from the model's CUDAGraphWrapper
+        (if present) and returns them in a dictionary keyed by either
+        num_tokens (int) or BatchDescriptor.
+
+        Returns:
+            Dictionary mapping graph keys to torch.cuda.CUDAGraph objects.
+            Empty dict if no graphs are captured or model is not wrapped.
+        """
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+
+        graphs: dict[int | BatchDescriptor, torch.cuda.CUDAGraph] = {}
+
+        # Check if model is wrapped with CUDAGraphWrapper directly
+        if isinstance(self.model, CUDAGraphWrapper):
+            for batch_desc, entry in self.model.concrete_cudagraph_entries.items():
+                if entry.cudagraph is not None:
+                    graphs[batch_desc] = entry.cudagraph
+
+        # Check if model is wrapped with UBatchWrapper
+        elif isinstance(self.model, UBatchWrapper):
+            # Get graphs from UBatchWrapper's internal cudagraphs dict
+            for num_tokens, metadata in self.model.cudagraphs.items():
+                if metadata.cudagraph is not None:
+                    graphs[num_tokens] = metadata.cudagraph
+
+            # Also get graphs from the inner CUDAGraphWrapper if present
+            if self.model.cudagraph_wrapper is not None:
+                for batch_desc, entry in (
+                    self.model.cudagraph_wrapper.concrete_cudagraph_entries.items()
+                ):
+                    if entry.cudagraph is not None:
+                        graphs[batch_desc] = entry.cudagraph
+
+        return graphs
+
+    @torch.inference_mode()
+    def benchmark_graph(
+        self,
+        graph_key: int | BatchDescriptor | None = None,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Benchmark a specific captured CUDA graph by replaying it.
+
+        This method replays the captured CUDA graph multiple times and
+        measures the execution time using CUDA events for accurate timing.
+
+        Args:
+            graph_key: Key identifying the graph to benchmark. Can be:
+                - int: num_tokens for the graph
+                - BatchDescriptor: full batch descriptor
+                - None: benchmark the first available graph
+            num_iterations: Number of timed iterations to run.
+            warmup_iterations: Number of warmup iterations before timing.
+
+        Returns:
+            Dictionary containing benchmark results:
+                - graph_key: The key of the benchmarked graph
+                - num_iterations: Number of iterations run
+                - warmup_iterations: Number of warmup iterations
+                - mean_ms: Mean execution time in milliseconds
+                - median_ms: Median execution time in milliseconds
+                - std_ms: Standard deviation in milliseconds
+                - min_ms: Minimum execution time in milliseconds
+                - max_ms: Maximum execution time in milliseconds
+                - percentiles: Dict of percentile values (p50, p90, p95, p99)
+                - all_times_ms: List of all measured times
+
+        Raises:
+            ValueError: If no graphs are captured or graph_key is not found.
+        """
+        import numpy as np
+
+        graphs = self.get_captured_graphs()
+        if not graphs:
+            raise ValueError(
+                "No CUDA graphs captured. Ensure the model has been warmed up "
+                "with actual inference requests to trigger graph capture."
+            )
+
+        # Select graph to benchmark
+        if graph_key is None:
+            # Use the first available graph
+            graph_key = next(iter(graphs.keys()))
+            logger.info("No graph_key specified, using first available: %s", graph_key)
+
+        if graph_key not in graphs:
+            available_keys = list(graphs.keys())
+            raise ValueError(
+                f"Graph with key {graph_key} not found. "
+                f"Available keys: {available_keys}"
+            )
+
+        graph = graphs[graph_key]
+
+        # Create CUDA events for timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Warmup iterations
+        logger.info("Running %d warmup iterations...", warmup_iterations)
+        for _ in range(warmup_iterations):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        # Timed iterations
+        logger.info("Running %d timed iterations...", num_iterations)
+        times_ms: list[float] = []
+
+        for _ in range(num_iterations):
+            start_event.record()
+            graph.replay()
+            end_event.record()
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            times_ms.append(elapsed_ms)
+
+        # Calculate statistics
+        times_array = np.array(times_ms)
+        percentiles = {
+            "p50": float(np.percentile(times_array, 50)),
+            "p90": float(np.percentile(times_array, 90)),
+            "p95": float(np.percentile(times_array, 95)),
+            "p99": float(np.percentile(times_array, 99)),
+        }
+
+        results = {
+            "graph_key": str(graph_key),
+            "num_iterations": num_iterations,
+            "warmup_iterations": warmup_iterations,
+            "mean_ms": float(np.mean(times_array)),
+            "median_ms": float(np.median(times_array)),
+            "std_ms": float(np.std(times_array)),
+            "min_ms": float(np.min(times_array)),
+            "max_ms": float(np.max(times_array)),
+            "percentiles": percentiles,
+            "all_times_ms": times_ms,
+        }
+
+        logger.info(
+            "Graph benchmark results for %s: mean=%.3fms, median=%.3fms, "
+            "std=%.3fms, min=%.3fms, max=%.3fms",
+            graph_key,
+            results["mean_ms"],
+            results["median_ms"],
+            results["std_ms"],
+            results["min_ms"],
+            results["max_ms"],
+        )
+
+        return results
+
+    def benchmark_all_graphs(
+        self,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, dict[str, Any]]:
+        """Benchmark all captured CUDA graphs.
+
+        Args:
+            num_iterations: Number of timed iterations per graph.
+            warmup_iterations: Number of warmup iterations per graph.
+
+        Returns:
+            Dictionary mapping graph keys (as strings) to their benchmark results.
+
+        Raises:
+            ValueError: If no graphs are captured.
+        """
+        graphs = self.get_captured_graphs()
+        if not graphs:
+            raise ValueError(
+                "No CUDA graphs captured. Ensure the model has been warmed up "
+                "with actual inference requests to trigger graph capture."
+            )
+
+        results: dict[str, dict[str, Any]] = {}
+        for graph_key in graphs.keys():
+            key_str = str(graph_key)
+            logger.info("Benchmarking graph: %s", key_str)
+            results[key_str] = self.benchmark_graph(
+                graph_key=graph_key,
+                num_iterations=num_iterations,
+                warmup_iterations=warmup_iterations,
+            )
+
+        return results
+
 
 @dataclass
 class EncoderTimingStats:

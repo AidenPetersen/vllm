@@ -925,6 +925,56 @@ class Worker(WorkerBase):
             tensorizer_config=tensorizer_config,
         )
 
+    def get_captured_graphs(self) -> dict[Any, torch.cuda.CUDAGraph]:
+        """Return all captured CUDA graphs for benchmarking.
+
+        Returns:
+            Dictionary mapping graph keys to torch.cuda.CUDAGraph objects.
+        """
+        return self.model_runner.get_captured_graphs()
+
+    def benchmark_graph(
+        self,
+        graph_key: Any | None = None,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Benchmark a specific captured CUDA graph.
+
+        Args:
+            graph_key: Key identifying the graph (num_tokens or BatchDescriptor).
+                      None uses the first available graph.
+            num_iterations: Number of timed iterations to run.
+            warmup_iterations: Number of warmup iterations before timing.
+
+        Returns:
+            Dictionary containing benchmark results with timing statistics.
+        """
+        return self.model_runner.benchmark_graph(
+            graph_key=graph_key,
+            num_iterations=num_iterations,
+            warmup_iterations=warmup_iterations,
+        )
+
+    def benchmark_all_graphs(
+        self,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, dict[str, Any]]:
+        """Benchmark all captured CUDA graphs.
+
+        Args:
+            num_iterations: Number of timed iterations per graph.
+            warmup_iterations: Number of warmup iterations per graph.
+
+        Returns:
+            Dictionary mapping graph keys to their benchmark results.
+        """
+        return self.model_runner.benchmark_all_graphs(
+            num_iterations=num_iterations,
+            warmup_iterations=warmup_iterations,
+        )
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

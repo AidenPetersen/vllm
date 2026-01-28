@@ -1528,6 +1528,81 @@ class LLM:
         """
         return self.llm_engine.get_metrics()
 
+    def get_captured_graphs(self) -> dict[Any, Any]:
+        """Return all captured CUDA graphs for benchmarking.
+
+        This method provides access to the CUDA graphs captured during model
+        warmup and inference for benchmarking purposes.
+
+        Returns:
+            Dictionary mapping graph keys (num_tokens or BatchDescriptor) to
+            torch.cuda.CUDAGraph objects. Empty dict if no graphs are captured.
+
+        Example:
+            >>> llm = LLM(model="meta-llama/Llama-2-7b-hf")
+            >>> llm.generate(["Hello"], max_tokens=1)  # Trigger graph capture
+            >>> graphs = llm.get_captured_graphs()
+            >>> print(f"Captured {len(graphs)} graphs")
+        """
+        return self.llm_engine.model_executor.driver_worker.get_captured_graphs()
+
+    def benchmark_graphs(
+        self,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+        graph_key: Any | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Benchmark captured CUDA graphs by replaying them.
+
+        This method provides a way to benchmark the performance of captured
+        CUDA graphs, which encapsulate the model's forward pass. It's useful
+        for measuring kernel execution time without scheduler overhead.
+
+        Args:
+            num_iterations: Number of timed iterations to run per graph.
+            warmup_iterations: Number of warmup iterations before timing.
+            graph_key: If specified, only benchmark this specific graph.
+                       Can be an int (num_tokens) or BatchDescriptor.
+                       If None, benchmarks all captured graphs.
+
+        Returns:
+            Dictionary mapping graph key strings to benchmark results.
+            Each result contains:
+            - mean_ms: Mean execution time in milliseconds
+            - median_ms: Median execution time
+            - std_ms: Standard deviation
+            - min_ms, max_ms: Min/max times
+            - percentiles: Dict with p50, p90, p95, p99 values
+            - all_times_ms: List of all measured times
+
+        Example:
+            >>> llm = LLM(model="meta-llama/Llama-2-7b-hf")
+            >>> llm.generate(["Hello"], max_tokens=1)  # Trigger graph capture
+            >>> results = llm.benchmark_graphs(num_iterations=100)
+            >>> for key, result in results.items():
+            ...     print(f"Graph {key}: {result['mean_ms']:.3f}ms")
+
+        Raises:
+            ValueError: If no graphs are captured (model not warmed up) or
+                       the specified graph_key is not found.
+        """
+        if graph_key is not None:
+            result = (
+                self.llm_engine.model_executor.driver_worker.benchmark_graph(
+                    graph_key=graph_key,
+                    num_iterations=num_iterations,
+                    warmup_iterations=warmup_iterations,
+                )
+            )
+            return {str(graph_key): result}
+        else:
+            return (
+                self.llm_engine.model_executor.driver_worker.benchmark_all_graphs(
+                    num_iterations=num_iterations,
+                    warmup_iterations=warmup_iterations,
+                )
+            )
+
     def _validate_and_add_requests(
         self,
         prompts: PromptType | Sequence[PromptType] | DataPrompt,

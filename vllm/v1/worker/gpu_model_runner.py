@@ -6393,37 +6393,21 @@ class GPUModelRunner(
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
-        # === Warmup iterations ===
+        # === Run ALL iterations identically, record all times ===
+        # We run warmup + timed iterations in a single loop to ensure
+        # identical execution. Then we discard the first warmup_iterations
+        # results to get clean measurements.
+        total_iterations = warmup_iterations + num_iterations
         logger.info(
-            "Running %d warmup iterations for prefill (%d tokens)...",
+            "Running %d total iterations (%d warmup + %d timed) for prefill (%d tokens)...",
+            total_iterations,
             warmup_iterations,
+            num_iterations,
             num_tokens,
         )
-        for _ in range(warmup_iterations):
-            with set_forward_context(
-                None,  # attn_metadata - None for eager mode
-                self.vllm_config,
-                num_tokens=actual_num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-            ):
-                self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-        torch.cuda.synchronize()
-
-        # === Timed iterations - ONLY timing the model forward pass ===
-        logger.info("Running %d timed iterations (model forward only)...", num_iterations)
-        times_ms: list[float] = []
-
-        for _ in range(num_iterations):
+        
+        all_times_ms: list[float] = []
+        for _ in range(total_iterations):
             with set_forward_context(
                 None,  # attn_metadata - None for eager mode
                 self.vllm_config,
@@ -6445,7 +6429,15 @@ class GPUModelRunner(
                 end_event.record()
             end_event.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
-            times_ms.append(elapsed_ms)
+            all_times_ms.append(elapsed_ms)
+
+        # Discard warmup iterations and keep only timed results
+        times_ms = all_times_ms[warmup_iterations:]
+        logger.info(
+            "Discarded first %d warmup iterations, using %d timed results",
+            warmup_iterations,
+            len(times_ms),
+        )
 
         # Calculate statistics
         times_array = np.array(times_ms)

@@ -6253,11 +6253,12 @@ class GPUModelRunner(
         num_iterations: int = 100,
         warmup_iterations: int = 10,
     ) -> dict[str, Any]:
-        """Benchmark prefill execution (eager mode forward pass).
+        """Benchmark prefill execution (model forward pass only).
 
-        This method runs the model forward pass in eager mode (without CUDA
-        graphs) to measure prefill performance. This simulates processing
-        a prompt of the given length.
+        This method times ONLY the model forward pass, excluding all setup
+        overhead (batch preparation, attention metadata building, etc.).
+        This provides accurate kernel-level performance measurements similar
+        to decode graph benchmarking.
 
         Args:
             num_tokens: Number of tokens to process (simulates prompt length).
@@ -6280,39 +6281,168 @@ class GPUModelRunner(
         import numpy as np
 
         from vllm.config import CUDAGraphMode
+        from vllm.distributed.parallel_state import get_pp_group
+        from vllm.forward_context import set_forward_context
+
+        logger.info(
+            "Setting up prefill benchmark for %d tokens...",
+            num_tokens,
+        )
+
+        # === Do all setup ONCE, outside the timing loop ===
+
+        # Prefill mode: multiple tokens per request
+        uniform_decode = False
+        max_query_len = num_tokens
+
+        # Set up batch configuration
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+        num_tokens_unpadded = int(num_scheduled_tokens.sum())
+
+        # Determine batch execution and padding
+        cudagraph_runtime_mode = CUDAGraphMode.NONE
+        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
+            self._determine_batch_execution_and_padding(
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens,
+                max_num_scheduled_tokens=max_query_len,
+                use_cascade_attn=False,
+                allow_microbatching=True,
+                force_eager=True,
+                force_uniform_decode=uniform_decode,
+                force_has_lora=False,
+            )
+        )
+
+        num_tokens_padded = batch_desc.num_tokens
+        num_reqs_padded = (
+            batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+        )
+
+        from vllm.v1.worker.gpu_model_runner import maybe_create_ubatch_slices
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.vllm_config.parallel_config.num_ubatches,
+        )
+
+        # Get slot mappings
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+        )
+
+        # Prepare model inputs (done once)
+        model_kwargs = self._init_model_kwargs()
+        if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
+            model_kwargs = {
+                **model_kwargs,
+                **self._dummy_mm_kwargs(num_reqs),
+            }
+        elif self.enable_prompt_embeds:
+            input_ids = None
+            inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+        else:
+            input_ids = self.input_ids.gpu[:num_tokens_padded]
+            inputs_embeds = None
+
+        if self.uses_mrope:
+            positions = self.mrope_positions.gpu[:, :num_tokens_padded]
+        elif self.uses_xdrope_dim > 0:
+            positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
+        else:
+            positions = self.positions.gpu[:num_tokens_padded]
+
+        if get_pp_group().is_first_rank:
+            intermediate_tensors = None
+        else:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = (
+                    self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
+                )
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                num_tokens_padded, None, False
+            )
+
+        # Adjust for ubatching if needed
+        actual_num_tokens = num_tokens_padded
+        if ubatch_slices_padded is not None:
+            actual_num_tokens = ubatch_slices_padded[0].num_tokens
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp[:] = actual_num_tokens
 
         # Create CUDA events for timing
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
-        # Warmup iterations - run without timing
+        # === Warmup iterations ===
         logger.info(
             "Running %d warmup iterations for prefill (%d tokens)...",
             warmup_iterations,
             num_tokens,
         )
         for _ in range(warmup_iterations):
-            self._dummy_run(
-                num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                uniform_decode=False,  # Prefill mode
-                skip_eplb=True,
-            )
+            with set_forward_context(
+                None,  # attn_metadata - None for eager mode
+                self.vllm_config,
+                num_tokens=actual_num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+            ):
+                self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
         torch.cuda.synchronize()
 
-        # Timed iterations
-        logger.info("Running %d timed iterations...", num_iterations)
+        # === Timed iterations - ONLY timing the model forward pass ===
+        logger.info("Running %d timed iterations (model forward only)...", num_iterations)
         times_ms: list[float] = []
 
         for _ in range(num_iterations):
-            start_event.record()
-            self._dummy_run(
-                num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                uniform_decode=False,  # Prefill mode
-                skip_eplb=True,
-            )
-            end_event.record()
+            with set_forward_context(
+                None,  # attn_metadata - None for eager mode
+                self.vllm_config,
+                num_tokens=actual_num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+            ):
+                start_event.record()
+                self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                end_event.record()
             end_event.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
             times_ms.append(elapsed_ms)

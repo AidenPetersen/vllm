@@ -6406,30 +6406,40 @@ class GPUModelRunner(
             num_tokens,
         )
         
-        all_times_ms: list[float] = []
-        for _ in range(total_iterations):
-            with set_forward_context(
-                None,  # attn_metadata - None for eager mode
-                self.vllm_config,
-                num_tokens=actual_num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-            ):
-                start_event.record()
-                self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-                end_event.record()
-            end_event.synchronize()
-            elapsed_ms = start_event.elapsed_time(end_event)
-            all_times_ms.append(elapsed_ms)
+        # Disable garbage collection during benchmark to avoid GC pauses
+        import gc
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        
+        try:
+            all_times_ms: list[float] = []
+            for _ in range(total_iterations):
+                with set_forward_context(
+                    None,  # attn_metadata - None for eager mode
+                    self.vllm_config,
+                    num_tokens=actual_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                ):
+                    start_event.record()
+                    self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                    end_event.record()
+                end_event.synchronize()
+                elapsed_ms = start_event.elapsed_time(end_event)
+                all_times_ms.append(elapsed_ms)
+        finally:
+            # Re-enable GC if it was enabled before
+            if gc_was_enabled:
+                gc.enable()
 
         # Discard warmup iterations and keep only timed results
         times_ms = all_times_ms[warmup_iterations:]

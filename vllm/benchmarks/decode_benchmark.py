@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark captured CUDA/HIP graphs in vLLM.
+"""Benchmark decode performance using captured CUDA/HIP graphs.
 
 This module provides utilities for benchmarking the performance of captured
-CUDA graphs used by vLLM during inference. It allows re-executing graphs
-multiple times to measure kernel performance accurately.
+CUDA graphs used by vLLM during decode (token generation). It allows
+re-executing graphs multiple times to measure kernel performance accurately.
 """
 
 import argparse
@@ -26,7 +26,7 @@ logger = init_logger(__name__)
 
 
 @dataclasses.dataclass
-class GraphBenchmarkResult:
+class DecodeBenchmarkResult:
     """Results from benchmarking a single CUDA graph."""
 
     graph_key: str
@@ -75,13 +75,13 @@ class GraphBenchmarkResult:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "GraphBenchmarkResult":
+    def from_dict(cls, data: dict[str, Any]) -> "DecodeBenchmarkResult":
         """Create from dictionary."""
         return cls(**data)
 
 
-class GraphBenchmarkRunner:
-    """Runner for benchmarking captured CUDA/HIP graphs.
+class DecodeBenchmarkRunner:
+    """Runner for benchmarking captured CUDA/HIP graphs (decode performance).
 
     This class provides methods to benchmark graphs captured during vLLM
     inference. It handles warmup, timing, and statistics collection.
@@ -92,7 +92,7 @@ class GraphBenchmarkRunner:
         >>> # Warmup to trigger graph capture
         >>> llm.generate(["Hello"], max_tokens=1)
         >>> # Run benchmarks
-        >>> runner = GraphBenchmarkRunner(llm)
+        >>> runner = DecodeBenchmarkRunner(llm)
         >>> results = runner.benchmark_all()
     """
 
@@ -110,8 +110,10 @@ class GraphBenchmarkRunner:
         Returns:
             Dictionary mapping graph keys to CUDAGraph objects.
         """
-        # Access graphs through the worker
-        return self.llm.llm_engine.model_executor.driver_worker.model_runner.get_captured_graphs()
+        # Access graphs through the worker.
+        # driver_worker is a WorkerWrapperBase, which contains the actual
+        # Worker instance in its 'worker' attribute.
+        return self.llm.llm_engine.model_executor.driver_worker.worker.get_captured_graphs()
 
     def list_graphs(self) -> list[str]:
         """List all available captured graph keys.
@@ -128,7 +130,7 @@ class GraphBenchmarkRunner:
         graph_key: Any | None = None,
         num_iterations: int = 100,
         warmup_iterations: int = 10,
-    ) -> GraphBenchmarkResult:
+    ) -> DecodeBenchmarkResult:
         """Benchmark a specific captured CUDA graph.
 
         Args:
@@ -137,7 +139,7 @@ class GraphBenchmarkRunner:
             warmup_iterations: Number of warmup iterations.
 
         Returns:
-            GraphBenchmarkResult with timing statistics.
+            DecodeBenchmarkResult with timing statistics.
 
         Raises:
             ValueError: If no graphs are captured or key not found.
@@ -192,7 +194,7 @@ class GraphBenchmarkRunner:
             "p99": float(np.percentile(times_array, 99)),
         }
 
-        result = GraphBenchmarkResult(
+        result = DecodeBenchmarkResult(
             graph_key=str(graph_key),
             num_iterations=num_iterations,
             warmup_iterations=warmup_iterations,
@@ -221,7 +223,7 @@ class GraphBenchmarkRunner:
         self,
         num_iterations: int = 100,
         warmup_iterations: int = 10,
-    ) -> dict[str, GraphBenchmarkResult]:
+    ) -> dict[str, DecodeBenchmarkResult]:
         """Benchmark all captured CUDA graphs.
 
         Args:
@@ -236,7 +238,7 @@ class GraphBenchmarkRunner:
         if not graphs:
             raise ValueError("No CUDA graphs captured.")
 
-        results: dict[str, GraphBenchmarkResult] = {}
+        results: dict[str, DecodeBenchmarkResult] = {}
         for graph_key in tqdm(list(graphs.keys()), desc="Graphs"):
             key_str = str(graph_key)
             logger.info("Benchmarking graph: %s", key_str)
@@ -255,8 +257,8 @@ def save_to_pytorch_benchmark_format(
     """Save results in PyTorch benchmark format."""
     metrics = {}
     for key, result in results.items():
-        metrics[f"graph_{key}_mean_ms"] = [result["mean_ms"]]
-        metrics[f"graph_{key}_median_ms"] = [result["median_ms"]]
+        metrics[f"decode_{key}_mean_ms"] = [result["mean_ms"]]
+        metrics[f"decode_{key}_median_ms"] = [result["median_ms"]]
 
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
@@ -271,7 +273,7 @@ def save_to_pytorch_benchmark_format(
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for graph benchmarking."""
+    """Add CLI arguments for decode benchmarking."""
     parser.add_argument(
         "--num-iterations",
         type=int,
@@ -292,10 +294,20 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "If not specified, benchmarks all captured graphs.",
     )
     parser.add_argument(
+        "--cudagraph-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific CUDA graph sizes (num_tokens) to capture. "
+        "Example: --cudagraph-sizes 1 8 16 32. "
+        "If not specified, uses vLLM's default sizes (1, 2, 4, 8, 16, ...).",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=8,
-        help="Batch size to use for warmup requests that trigger graph capture.",
+        help="Number of prompts to send for warmup inference after graph capture. "
+        "This does NOT control which graph sizes are captured (use --cudagraph-sizes).",
     )
     parser.add_argument(
         "--input-len",
@@ -328,18 +340,47 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main(args: argparse.Namespace) -> None:
-    """Main function for graph benchmarking CLI."""
+    """Main function for decode benchmarking CLI."""
+    import os
+
+    # Disable V1 multiprocessing to allow direct access to model components.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    logger.info(
+        "Setting VLLM_ENABLE_V1_MULTIPROCESSING=0 for direct graph access."
+    )
+
     # Lazy imports
     from vllm import LLM, SamplingParams
+    from vllm.config import CompilationConfig
 
     engine_args = EngineArgs.from_cli_args(args)
 
-    logger.info("Initializing vLLM engine...")
-    llm = LLM(**dataclasses.asdict(engine_args))
+    # Convert engine_args to dict for LLM initialization
+    llm_kwargs = dataclasses.asdict(engine_args)
 
-    # Generate warmup requests to trigger graph capture
+    # Handle cudagraph_sizes override
+    if args.cudagraph_sizes is not None:
+        cudagraph_sizes = sorted(args.cudagraph_sizes)
+        logger.info(
+            "Using custom cudagraph_capture_sizes: %s",
+            cudagraph_sizes,
+        )
+        # Create or update compilation_config with custom sizes
+        if llm_kwargs.get("compilation_config") is None:
+            llm_kwargs["compilation_config"] = CompilationConfig(
+                cudagraph_capture_sizes=cudagraph_sizes,
+            )
+        elif isinstance(llm_kwargs["compilation_config"], dict):
+            llm_kwargs["compilation_config"]["cudagraph_capture_sizes"] = cudagraph_sizes
+        elif isinstance(llm_kwargs["compilation_config"], CompilationConfig):
+            llm_kwargs["compilation_config"].cudagraph_capture_sizes = cudagraph_sizes
+
+    logger.info("Initializing vLLM engine...")
+    llm = LLM(**llm_kwargs)
+
+    # Generate warmup requests to exercise the captured graphs
     logger.info(
-        "Running warmup requests to trigger graph capture "
+        "Running warmup inference "
         "(batch_size=%d, input_len=%d, output_len=%d)...",
         args.batch_size,
         args.input_len,
@@ -361,11 +402,11 @@ def main(args: argparse.Namespace) -> None:
         {"prompt_token_ids": batch} for batch in dummy_prompt_token_ids.tolist()
     ]
 
-    # Run warmup to capture graphs
+    # Run warmup inference
     llm.generate(dummy_prompts, sampling_params=sampling_params, use_tqdm=False)
 
     # Create benchmark runner
-    runner = GraphBenchmarkRunner(llm)
+    runner = DecodeBenchmarkRunner(llm)
 
     # List graphs if requested
     if args.list_graphs:
@@ -377,7 +418,7 @@ def main(args: argparse.Namespace) -> None:
         return
 
     # Run benchmarks
-    logger.info("Starting graph benchmarks...")
+    logger.info("Starting decode (CUDA graph) benchmarks...")
     start_time = time.perf_counter()
 
     if args.graph_size is not None:
@@ -400,7 +441,7 @@ def main(args: argparse.Namespace) -> None:
 
     # Print summary
     print("\n" + "=" * 60)
-    print("CUDA Graph Benchmark Results")
+    print("Decode (CUDA Graph) Benchmark Results")
     print("=" * 60)
 
     for key, result in all_results.items():
@@ -429,6 +470,7 @@ def main(args: argparse.Namespace) -> None:
                 "output_len": args.output_len,
                 "num_iterations": args.num_iterations,
                 "warmup_iterations": args.warmup_iterations,
+                "cudagraph_sizes": args.cudagraph_sizes,
             },
             "results": all_results,
             "total_time_seconds": end_time - start_time,

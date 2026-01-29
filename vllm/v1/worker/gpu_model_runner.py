@@ -6246,6 +6246,138 @@ class GPUModelRunner(
 
         return results
 
+    @torch.inference_mode()
+    def benchmark_prefill(
+        self,
+        num_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Benchmark prefill execution (eager mode forward pass).
+
+        This method runs the model forward pass in eager mode (without CUDA
+        graphs) to measure prefill performance. This simulates processing
+        a prompt of the given length.
+
+        Args:
+            num_tokens: Number of tokens to process (simulates prompt length).
+            num_iterations: Number of timed iterations to run.
+            warmup_iterations: Number of warmup iterations before timing.
+
+        Returns:
+            Dictionary containing benchmark results:
+                - num_tokens: Number of tokens benchmarked
+                - num_iterations: Number of iterations run
+                - warmup_iterations: Number of warmup iterations
+                - mean_ms: Mean execution time in milliseconds
+                - median_ms: Median execution time in milliseconds
+                - std_ms: Standard deviation in milliseconds
+                - min_ms: Minimum execution time in milliseconds
+                - max_ms: Maximum execution time in milliseconds
+                - percentiles: Dict of percentile values (p50, p90, p95, p99)
+                - all_times_ms: List of all measured times
+        """
+        import numpy as np
+
+        from vllm.config import CUDAGraphMode
+
+        # Create CUDA events for timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Warmup iterations - run without timing
+        logger.info(
+            "Running %d warmup iterations for prefill (%d tokens)...",
+            warmup_iterations,
+            num_tokens,
+        )
+        for _ in range(warmup_iterations):
+            self._dummy_run(
+                num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                uniform_decode=False,  # Prefill mode
+                skip_eplb=True,
+            )
+        torch.cuda.synchronize()
+
+        # Timed iterations
+        logger.info("Running %d timed iterations...", num_iterations)
+        times_ms: list[float] = []
+
+        for _ in range(num_iterations):
+            start_event.record()
+            self._dummy_run(
+                num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                uniform_decode=False,  # Prefill mode
+                skip_eplb=True,
+            )
+            end_event.record()
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            times_ms.append(elapsed_ms)
+
+        # Calculate statistics
+        times_array = np.array(times_ms)
+        percentiles = {
+            "p50": float(np.percentile(times_array, 50)),
+            "p90": float(np.percentile(times_array, 90)),
+            "p95": float(np.percentile(times_array, 95)),
+            "p99": float(np.percentile(times_array, 99)),
+        }
+
+        results = {
+            "num_tokens": num_tokens,
+            "num_iterations": num_iterations,
+            "warmup_iterations": warmup_iterations,
+            "mean_ms": float(np.mean(times_array)),
+            "median_ms": float(np.median(times_array)),
+            "std_ms": float(np.std(times_array)),
+            "min_ms": float(np.min(times_array)),
+            "max_ms": float(np.max(times_array)),
+            "percentiles": percentiles,
+            "all_times_ms": times_ms,
+        }
+
+        logger.info(
+            "Prefill benchmark results for %d tokens: mean=%.3fms, median=%.3fms, "
+            "std=%.3fms, min=%.3fms, max=%.3fms",
+            num_tokens,
+            results["mean_ms"],
+            results["median_ms"],
+            results["std_ms"],
+            results["min_ms"],
+            results["max_ms"],
+        )
+
+        return results
+
+    def benchmark_prefill_sizes(
+        self,
+        sizes: list[int],
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[int, dict[str, Any]]:
+        """Benchmark prefill execution for multiple token sizes.
+
+        Args:
+            sizes: List of token counts to benchmark.
+            num_iterations: Number of timed iterations per size.
+            warmup_iterations: Number of warmup iterations per size.
+
+        Returns:
+            Dictionary mapping token counts to their benchmark results.
+        """
+        results: dict[int, dict[str, Any]] = {}
+        for num_tokens in sizes:
+            logger.info("Benchmarking prefill for %d tokens...", num_tokens)
+            results[num_tokens] = self.benchmark_prefill(
+                num_tokens=num_tokens,
+                num_iterations=num_iterations,
+                warmup_iterations=warmup_iterations,
+            )
+        return results
+
 
 @dataclass
 class EncoderTimingStats:

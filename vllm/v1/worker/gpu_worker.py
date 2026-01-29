@@ -975,6 +975,50 @@ class Worker(WorkerBase):
             warmup_iterations=warmup_iterations,
         )
 
+    def benchmark_prefill(
+        self,
+        num_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Benchmark prefill execution (eager mode forward pass).
+
+        Args:
+            num_tokens: Number of tokens to process (simulates prompt length).
+            num_iterations: Number of timed iterations to run.
+            warmup_iterations: Number of warmup iterations before timing.
+
+        Returns:
+            Dictionary containing benchmark results with timing statistics.
+        """
+        return self.model_runner.benchmark_prefill(
+            num_tokens=num_tokens,
+            num_iterations=num_iterations,
+            warmup_iterations=warmup_iterations,
+        )
+
+    def benchmark_prefill_sizes(
+        self,
+        sizes: list[int],
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict[int, dict[str, Any]]:
+        """Benchmark prefill execution for multiple token sizes.
+
+        Args:
+            sizes: List of token counts to benchmark.
+            num_iterations: Number of timed iterations per size.
+            warmup_iterations: Number of warmup iterations per size.
+
+        Returns:
+            Dictionary mapping token counts to their benchmark results.
+        """
+        return self.model_runner.benchmark_prefill_sizes(
+            sizes=sizes,
+            num_iterations=num_iterations,
+            warmup_iterations=warmup_iterations,
+        )
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

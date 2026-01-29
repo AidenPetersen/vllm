@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Import all benchmark subcommands to register them with BenchmarkSubcommandBase
+from vllm.entrypoints.cli.benchmark.decode import BenchmarkDecodeSubcommand
+from vllm.entrypoints.cli.benchmark.latency import BenchmarkLatencySubcommand
+from vllm.entrypoints.cli.benchmark.mm_processor import (
+    BenchmarkMMProcessorSubcommand,
+)
+from vllm.entrypoints.cli.benchmark.prefill import BenchmarkPrefillSubcommand
+from vllm.entrypoints.cli.benchmark.serve import BenchmarkServingSubcommand
+from vllm.entrypoints.cli.benchmark.startup import BenchmarkStartupSubcommand
+from vllm.entrypoints.cli.benchmark.sweep import BenchmarkSweepSubcommand
+from vllm.entrypoints.cli.benchmark.throughput import BenchmarkThroughputSubcommand
+
+__all__ = [
+    "BenchmarkDecodeSubcommand",
+    "BenchmarkLatencySubcommand",
+    "BenchmarkMMProcessorSubcommand",
+    "BenchmarkPrefillSubcommand",
+    "BenchmarkServingSubcommand",
+    "BenchmarkStartupSubcommand",
+    "BenchmarkSweepSubcommand",
+    "BenchmarkThroughputSubcommand",
+]

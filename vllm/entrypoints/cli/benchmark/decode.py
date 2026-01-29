@@ -2,19 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 
-from vllm.benchmarks.graph_benchmark import add_cli_args, main
+from vllm.benchmarks.decode_benchmark import add_cli_args, main
 from vllm.entrypoints.cli.benchmark.base import BenchmarkSubcommandBase
 
 
-class BenchmarkGraphSubcommand(BenchmarkSubcommandBase):
-    """The `graph` subcommand for `vllm bench`.
+class BenchmarkDecodeSubcommand(BenchmarkSubcommandBase):
+    """The `decode` subcommand for `vllm bench`.
 
-    Benchmarks captured CUDA/HIP graphs by replaying them multiple times
-    to measure kernel execution performance.
+    Benchmarks decode performance by replaying captured CUDA/HIP graphs
+    multiple times to measure kernel execution performance.
     """
 
-    name = "graph"
-    help = "Benchmark captured CUDA/HIP graphs for kernel performance analysis."
+    name = "decode"
+    help = "Benchmark decode performance using captured CUDA/HIP graphs."
 
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:

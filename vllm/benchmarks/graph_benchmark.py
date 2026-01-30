@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark decode performance using captured CUDA/HIP graphs.
+"""Benchmark CUDA/HIP graph replay performance.
 
 This module provides utilities for benchmarking the performance of captured
-CUDA graphs used by vLLM during decode (token generation). It allows
-re-executing graphs multiple times to measure kernel performance accurately.
+CUDA graphs used by vLLM. It allows re-executing graphs multiple times to
+measure kernel performance accurately.
+
+Output is JSON to stdout in the format:
+{
+    "batch_size_1": {"time": <geomean_ms>, "weight": <1/num_graphs>},
+    "batch_size_8": {"time": <geomean_ms>, "weight": <1/num_graphs>},
+    ...
+}
 """
 
 import argparse
 import dataclasses
 import json
-import time
+import logging
+import sys
 from typing import Any
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -25,8 +32,26 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _configure_logging_to_stderr() -> None:
+    """Configure all logging to go to stderr so stdout is clean for JSON output."""
+    # Get the root logger and all vllm loggers
+    root_logger = logging.getLogger()
+    
+    # Remove any existing handlers that might write to stdout
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add a stderr handler
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(
+        logging.Formatter("%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s")
+    )
+    root_logger.addHandler(stderr_handler)
+    root_logger.setLevel(logging.INFO)
+
+
 @dataclasses.dataclass
-class DecodeBenchmarkResult:
+class GraphBenchmarkResult:
     """Results from benchmarking a single CUDA graph."""
 
     graph_key: str
@@ -38,8 +63,11 @@ class DecodeBenchmarkResult:
     warmup_iterations: int
     """Number of warmup iterations run before timing."""
 
+    geomean_ms: float
+    """Geometric mean execution time in milliseconds."""
+
     mean_ms: float
-    """Mean execution time in milliseconds."""
+    """Arithmetic mean execution time in milliseconds."""
 
     median_ms: float
     """Median execution time in milliseconds."""
@@ -53,9 +81,6 @@ class DecodeBenchmarkResult:
     max_ms: float
     """Maximum execution time in milliseconds."""
 
-    percentiles: dict[str, float]
-    """Percentile values (p50, p90, p95, p99)."""
-
     all_times_ms: list[float]
     """List of all measured execution times."""
 
@@ -65,35 +90,21 @@ class DecodeBenchmarkResult:
             "graph_key": self.graph_key,
             "num_iterations": self.num_iterations,
             "warmup_iterations": self.warmup_iterations,
+            "geomean_ms": self.geomean_ms,
             "mean_ms": self.mean_ms,
             "median_ms": self.median_ms,
             "std_ms": self.std_ms,
             "min_ms": self.min_ms,
             "max_ms": self.max_ms,
-            "percentiles": self.percentiles,
             "all_times_ms": self.all_times_ms,
         }
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DecodeBenchmarkResult":
-        """Create from dictionary."""
-        return cls(**data)
 
-
-class DecodeBenchmarkRunner:
-    """Runner for benchmarking captured CUDA/HIP graphs (decode performance).
+class GraphBenchmarkRunner:
+    """Runner for benchmarking captured CUDA/HIP graphs.
 
     This class provides methods to benchmark graphs captured during vLLM
     inference. It handles warmup, timing, and statistics collection.
-
-    Example:
-        >>> from vllm import LLM
-        >>> llm = LLM(model="meta-llama/Llama-2-7b-hf")
-        >>> # Warmup to trigger graph capture
-        >>> llm.generate(["Hello"], max_tokens=1)
-        >>> # Run benchmarks
-        >>> runner = DecodeBenchmarkRunner(llm)
-        >>> results = runner.benchmark_all()
     """
 
     def __init__(self, llm: Any):
@@ -130,7 +141,7 @@ class DecodeBenchmarkRunner:
         graph_key: Any | None = None,
         num_iterations: int = 100,
         warmup_iterations: int = 10,
-    ) -> DecodeBenchmarkResult:
+    ) -> GraphBenchmarkResult:
         """Benchmark a specific captured CUDA graph.
 
         Args:
@@ -139,7 +150,7 @@ class DecodeBenchmarkRunner:
             warmup_iterations: Number of warmup iterations.
 
         Returns:
-            DecodeBenchmarkResult with timing statistics.
+            GraphBenchmarkResult with timing statistics.
 
         Raises:
             ValueError: If no graphs are captured or key not found.
@@ -178,7 +189,8 @@ class DecodeBenchmarkRunner:
         logger.info("Running %d timed iterations...", num_iterations)
         times_ms: list[float] = []
 
-        for _ in tqdm(range(num_iterations), desc="Benchmarking"):
+        # tqdm outputs to stderr by default
+        for _ in tqdm(range(num_iterations), desc="Benchmarking", file=sys.stderr):
             start_event.record()
             graph.replay()
             end_event.record()
@@ -187,29 +199,26 @@ class DecodeBenchmarkRunner:
 
         # Calculate statistics
         times_array = np.array(times_ms)
-        percentiles = {
-            "p50": float(np.percentile(times_array, 50)),
-            "p90": float(np.percentile(times_array, 90)),
-            "p95": float(np.percentile(times_array, 95)),
-            "p99": float(np.percentile(times_array, 99)),
-        }
+        # Geometric mean: exp(mean(log(x)))
+        geomean = float(np.exp(np.mean(np.log(times_array))))
 
-        result = DecodeBenchmarkResult(
+        result = GraphBenchmarkResult(
             graph_key=str(graph_key),
             num_iterations=num_iterations,
             warmup_iterations=warmup_iterations,
+            geomean_ms=geomean,
             mean_ms=float(np.mean(times_array)),
             median_ms=float(np.median(times_array)),
             std_ms=float(np.std(times_array)),
             min_ms=float(np.min(times_array)),
             max_ms=float(np.max(times_array)),
-            percentiles=percentiles,
             all_times_ms=times_ms,
         )
 
         logger.info(
-            "Benchmark complete: mean=%.3fms, median=%.3fms, "
+            "Benchmark complete: geomean=%.3fms, mean=%.3fms, median=%.3fms, "
             "std=%.3fms, min=%.3fms, max=%.3fms",
+            result.geomean_ms,
             result.mean_ms,
             result.median_ms,
             result.std_ms,
@@ -223,7 +232,7 @@ class DecodeBenchmarkRunner:
         self,
         num_iterations: int = 100,
         warmup_iterations: int = 10,
-    ) -> dict[str, DecodeBenchmarkResult]:
+    ) -> dict[str, GraphBenchmarkResult]:
         """Benchmark all captured CUDA graphs.
 
         Args:
@@ -238,8 +247,8 @@ class DecodeBenchmarkRunner:
         if not graphs:
             raise ValueError("No CUDA graphs captured.")
 
-        results: dict[str, DecodeBenchmarkResult] = {}
-        for graph_key in tqdm(list(graphs.keys()), desc="Graphs"):
+        results: dict[str, GraphBenchmarkResult] = {}
+        for graph_key in tqdm(list(graphs.keys()), desc="Graphs", file=sys.stderr):
             key_str = str(graph_key)
             logger.info("Benchmarking graph: %s", key_str)
             results[key_str] = self.benchmark_graph(
@@ -251,29 +260,8 @@ class DecodeBenchmarkRunner:
         return results
 
 
-def save_to_pytorch_benchmark_format(
-    args: argparse.Namespace, results: dict[str, Any]
-) -> None:
-    """Save results in PyTorch benchmark format."""
-    metrics = {}
-    for key, result in results.items():
-        metrics[f"decode_{key}_mean_ms"] = [result["mean_ms"]]
-        metrics[f"decode_{key}_median_ms"] = [result["median_ms"]]
-
-    pt_records = convert_to_pytorch_benchmark_format(
-        args=args,
-        metrics=metrics,
-        extra_info={"results": results},
-    )
-    if pt_records:
-        import os
-
-        pt_file = f"{os.path.splitext(args.output_json)[0]}.pytorch.json"
-        write_to_json(pt_file, pt_records)
-
-
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for decode benchmarking."""
+    """Add CLI arguments for graph benchmarking."""
     parser.add_argument(
         "--num-iterations",
         type=int,
@@ -325,7 +313,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         "--output-json",
         type=str,
         default=None,
-        help="Path to save benchmark results as JSON.",
+        help="Path to save detailed benchmark results as JSON file.",
     )
     parser.add_argument(
         "--list-graphs",
@@ -340,8 +328,11 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main(args: argparse.Namespace) -> None:
-    """Main function for decode benchmarking CLI."""
+    """Main function for graph benchmarking CLI."""
     import os
+
+    # Configure all logging to go to stderr so stdout is clean for JSON
+    _configure_logging_to_stderr()
 
     # Disable V1 multiprocessing to allow direct access to model components.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -406,20 +397,20 @@ def main(args: argparse.Namespace) -> None:
     llm.generate(dummy_prompts, sampling_params=sampling_params, use_tqdm=False)
 
     # Create benchmark runner
-    runner = DecodeBenchmarkRunner(llm)
+    runner = GraphBenchmarkRunner(llm)
 
     # List graphs if requested
     if args.list_graphs:
         graphs = runner.list_graphs()
-        print("\nCaptured CUDA graphs:")
+        # Output list to stderr since it's not the main JSON result
+        print("\nCaptured CUDA graphs:", file=sys.stderr)
         for i, key in enumerate(graphs, 1):
-            print(f"  {i}. {key}")
-        print(f"\nTotal: {len(graphs)} graphs")
+            print(f"  {i}. {key}", file=sys.stderr)
+        print(f"\nTotal: {len(graphs)} graphs", file=sys.stderr)
         return
 
     # Run benchmarks
-    logger.info("Starting decode (CUDA graph) benchmarks...")
-    start_time = time.perf_counter()
+    logger.info("Starting CUDA graph benchmarks...")
 
     if args.graph_size is not None:
         # Benchmark specific graph size
@@ -428,41 +419,32 @@ def main(args: argparse.Namespace) -> None:
             num_iterations=args.num_iterations,
             warmup_iterations=args.warmup_iterations,
         )
-        all_results = {str(args.graph_size): result.to_dict()}
+        all_results = {str(args.graph_size): result}
     else:
         # Benchmark all graphs
-        results = runner.benchmark_all(
+        all_results = runner.benchmark_all(
             num_iterations=args.num_iterations,
             warmup_iterations=args.warmup_iterations,
         )
-        all_results = {key: res.to_dict() for key, res in results.items()}
 
-    end_time = time.perf_counter()
+    # Build output JSON in the requested format:
+    # { "batch_size_x": {"time": <geomean>, "weight": <1/num_graphs>} }
+    num_graphs = len(all_results)
+    weight = 1.0 / num_graphs if num_graphs > 0 else 0.0
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("Decode (CUDA Graph) Benchmark Results")
-    print("=" * 60)
-
+    output_json: dict[str, dict[str, float]] = {}
     for key, result in all_results.items():
-        print(f"\nGraph: {key}")
-        print(f"  Mean:   {result['mean_ms']:.3f} ms")
-        print(f"  Median: {result['median_ms']:.3f} ms")
-        print(f"  Std:    {result['std_ms']:.3f} ms")
-        print(f"  Min:    {result['min_ms']:.3f} ms")
-        print(f"  Max:    {result['max_ms']:.3f} ms")
-        print(f"  P50:    {result['percentiles']['p50']:.3f} ms")
-        print(f"  P90:    {result['percentiles']['p90']:.3f} ms")
-        print(f"  P95:    {result['percentiles']['p95']:.3f} ms")
-        print(f"  P99:    {result['percentiles']['p99']:.3f} ms")
+        output_json[f"batch_size_{key}"] = {
+            "time": result.geomean_ms,
+            "weight": weight,
+        }
 
-    print("\n" + "-" * 60)
-    print(f"Total benchmark time: {end_time - start_time:.2f} seconds")
-    print("=" * 60)
+    # Output JSON to stdout
+    print(json.dumps(output_json, indent=2))
 
-    # Save results if requested
+    # Save detailed results to file if requested
     if args.output_json:
-        output_data = {
+        detailed_output = {
             "args": {
                 "model": args.model,
                 "batch_size": args.batch_size,
@@ -472,10 +454,8 @@ def main(args: argparse.Namespace) -> None:
                 "warmup_iterations": args.warmup_iterations,
                 "cudagraph_sizes": args.cudagraph_sizes,
             },
-            "results": all_results,
-            "total_time_seconds": end_time - start_time,
+            "results": {key: res.to_dict() for key, res in all_results.items()},
         }
         with open(args.output_json, "w") as f:
-            json.dump(output_data, f, indent=2)
-        logger.info("Results saved to %s", args.output_json)
-        save_to_pytorch_benchmark_format(args, all_results)
+            json.dump(detailed_output, f, indent=2)
+        logger.info("Detailed results saved to %s", args.output_json)

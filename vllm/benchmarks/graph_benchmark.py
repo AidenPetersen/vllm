@@ -14,40 +14,21 @@ Output is JSON to stdout in the format:
 }
 """
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
-import logging
+import os
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from vllm.engine.arg_utils import EngineArgs
-from vllm.inputs import PromptType
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
-
-def _configure_logging_to_stderr() -> None:
-    """Configure all logging to go to stderr so stdout is clean for JSON output."""
-    # Get the root logger and all vllm loggers
-    root_logger = logging.getLogger()
-    
-    # Remove any existing handlers that might write to stdout
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Add a stderr handler
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(
-        logging.Formatter("%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s")
-    )
-    root_logger.addHandler(stderr_handler)
-    root_logger.setLevel(logging.INFO)
+if TYPE_CHECKING:
+    from vllm import LLM
 
 
 @dataclasses.dataclass
@@ -107,7 +88,7 @@ class GraphBenchmarkRunner:
     inference. It handles warmup, timing, and statistics collection.
     """
 
-    def __init__(self, llm: Any):
+    def __init__(self, llm: LLM):
         """Initialize the benchmark runner.
 
         Args:
@@ -155,6 +136,10 @@ class GraphBenchmarkRunner:
         Raises:
             ValueError: If no graphs are captured or key not found.
         """
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+
         graphs = self.get_captured_graphs()
 
         if not graphs:
@@ -242,6 +227,10 @@ class GraphBenchmarkRunner:
         Returns:
             Dictionary mapping graph key strings to results.
         """
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+
         graphs = self.get_captured_graphs()
 
         if not graphs:
@@ -262,6 +251,9 @@ class GraphBenchmarkRunner:
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for graph benchmarking."""
+    # Import lazily to avoid importing vllm at module load time
+    from vllm.engine.arg_utils import EngineArgs
+
     parser.add_argument(
         "--num-iterations",
         type=int,
@@ -329,20 +321,22 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
 def main(args: argparse.Namespace) -> None:
     """Main function for graph benchmarking CLI."""
-    import os
-
-    # Configure all logging to go to stderr so stdout is clean for JSON
-    _configure_logging_to_stderr()
-
     # Disable V1 multiprocessing to allow direct access to model components.
+    # Note: VLLM_LOGGING_STREAM is set in the CLI entrypoint (graph.py) before
+    # any vLLM imports to ensure logging goes to stderr.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    from vllm import LLM, SamplingParams
+    from vllm.config import CompilationConfig
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.inputs import PromptType
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+
     logger.info(
         "Setting VLLM_ENABLE_V1_MULTIPROCESSING=0 for direct graph access."
     )
-
-    # Lazy imports
-    from vllm import LLM, SamplingParams
-    from vllm.config import CompilationConfig
 
     engine_args = EngineArgs.from_cli_args(args)
 

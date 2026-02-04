@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Set environment variables BEFORE any vLLM imports to ensure logging
+# goes to stderr so stdout is clean for JSON output.
+import os
+
+os.environ["VLLM_LOGGING_STREAM"] = "ext://sys.stderr"
+
 import argparse
 
 from vllm.benchmarks.graph_benchmark import add_cli_args, main

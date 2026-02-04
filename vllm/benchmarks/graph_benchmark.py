@@ -6,7 +6,7 @@ This module provides utilities for benchmarking the performance of captured
 CUDA graphs used by vLLM. It allows re-executing graphs multiple times to
 measure kernel performance accurately.
 
-Output is JSON to stdout in the format:
+Output is JSON written to a file specified by -o/--output:
 {
     "batch_size_1": {"time": <geomean_ms>, "weight": <1/num_graphs>},
     "batch_size_8": {"time": <geomean_ms>, "weight": <1/num_graphs>},
@@ -20,7 +20,6 @@ import argparse
 import dataclasses
 import json
 import os
-import sys
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -174,8 +173,7 @@ class GraphBenchmarkRunner:
         logger.info("Running %d timed iterations...", num_iterations)
         times_ms: list[float] = []
 
-        # tqdm outputs to stderr by default
-        for _ in tqdm(range(num_iterations), desc="Benchmarking", file=sys.stderr):
+        for _ in tqdm(range(num_iterations), desc="Benchmarking"):
             start_event.record()
             graph.replay()
             end_event.record()
@@ -237,7 +235,7 @@ class GraphBenchmarkRunner:
             raise ValueError("No CUDA graphs captured.")
 
         results: dict[str, GraphBenchmarkResult] = {}
-        for graph_key in tqdm(list(graphs.keys()), desc="Graphs", file=sys.stderr):
+        for graph_key in tqdm(list(graphs.keys()), desc="Graphs"):
             key_str = str(graph_key)
             logger.info("Benchmarking graph: %s", key_str)
             results[key_str] = self.benchmark_graph(
@@ -254,6 +252,13 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     # Import lazily to avoid importing vllm at module load time
     from vllm.engine.arg_utils import EngineArgs
 
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        required=True,
+        help="Path to save benchmark results as JSON file (required).",
+    )
     parser.add_argument(
         "--num-iterations",
         type=int,
@@ -302,12 +307,6 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Output length for warmup requests.",
     )
     parser.add_argument(
-        "--output-json",
-        type=str,
-        default=None,
-        help="Path to save detailed benchmark results as JSON file.",
-    )
-    parser.add_argument(
         "--list-graphs",
         action="store_true",
         help="List available captured graphs and exit.",
@@ -322,8 +321,6 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 def main(args: argparse.Namespace) -> None:
     """Main function for graph benchmarking CLI."""
     # Disable V1 multiprocessing to allow direct access to model components.
-    # Note: VLLM_LOGGING_STREAM is set in the CLI entrypoint (graph.py) before
-    # any vLLM imports to ensure logging goes to stderr.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     from vllm import LLM, SamplingParams
@@ -396,11 +393,10 @@ def main(args: argparse.Namespace) -> None:
     # List graphs if requested
     if args.list_graphs:
         graphs = runner.list_graphs()
-        # Output list to stderr since it's not the main JSON result
-        print("\nCaptured CUDA graphs:", file=sys.stderr)
+        print("\nCaptured CUDA graphs:")
         for i, key in enumerate(graphs, 1):
-            print(f"  {i}. {key}", file=sys.stderr)
-        print(f"\nTotal: {len(graphs)} graphs", file=sys.stderr)
+            print(f"  {i}. {key}")
+        print(f"\nTotal: {len(graphs)} graphs")
         return
 
     # Run benchmarks
@@ -433,23 +429,8 @@ def main(args: argparse.Namespace) -> None:
             "weight": weight,
         }
 
-    # Output JSON to stdout
-    print(json.dumps(output_json, indent=2))
+    # Write JSON to output file
+    with open(args.output, "w") as f:
+        json.dump(output_json, f, indent=2)
 
-    # Save detailed results to file if requested
-    if args.output_json:
-        detailed_output = {
-            "args": {
-                "model": args.model,
-                "batch_size": args.batch_size,
-                "input_len": args.input_len,
-                "output_len": args.output_len,
-                "num_iterations": args.num_iterations,
-                "warmup_iterations": args.warmup_iterations,
-                "cudagraph_sizes": args.cudagraph_sizes,
-            },
-            "results": {key: res.to_dict() for key, res in all_results.items()},
-        }
-        with open(args.output_json, "w") as f:
-            json.dump(detailed_output, f, indent=2)
-        logger.info("Detailed results saved to %s", args.output_json)
+    logger.info("Results saved to %s", args.output)
